@@ -1,93 +1,190 @@
-# Alarmserver
+# Alarm-Core
 
+Mandantenfähiges, kanalunabhängiges Alarmierungssystem der Example AG.
 
+Empfängt Events via HTTP-Webhook, matched sie gegen ein konfigurierbares Regelwerk und alarmiert Zielgruppen über Telefon (Asterisk), SMS (SMSEAGLE), E-Mail oder Microsoft Teams. Vollständig auditiert, mit Wartungsfenstern, Heartbeat-Überwachung, Wiederhol-Benachrichtigung und einer Vue-3-Management-Oberfläche.
 
-## Getting started
+---
 
-To make it easy for you to get started with GitLab, here's a list of recommended next steps.
+## Schnellstart (lokale Entwicklung mit Docker)
 
-Already a pro? Just edit this README.md and make it your own. Want to make it easy? [Use the template at the bottom](#editing-this-readme)!
+```bash
+# PostgreSQL + Frontend-Dev-Server
+docker compose up -d db
+cd frontend && npm install && npm run dev
 
-## Add your files
-
-* [Create](https://docs.gitlab.com/user/project/repository/web_editor/#create-a-file) or [upload](https://docs.gitlab.com/user/project/repository/web_editor/#upload-a-file) files
-* [Add files using the command line](https://docs.gitlab.com/topics/git/add_files/#add-files-to-a-git-repository) or push an existing Git repository with the following command:
-
-```
-cd existing_repo
-git remote add origin https://github.com/bh2005/alarmserver.git
-git branch -M main
-git push -uf origin main
+# Backend (Go)
+go run ./cmd/alarm-core
 ```
 
-## Integrate with your tools
+Umgebungsvariablen aus `deploy/alarm-core.env.example` kopieren und anpassen:
 
-* [Set up project integrations](https://github.com/bh2005/alarmserver/-/settings/integrations)
+```bash
+cp deploy/alarm-core.env.example .env
+# .env bearbeiten, dann:
+export $(cat .env | xargs)
+go run ./cmd/alarm-core
+```
 
-## Collaborate with your team
+Das Frontend läuft auf Port 5173 (Vite Dev), das Backend auf Port 8080.
 
-* [Invite team members and collaborators](https://docs.gitlab.com/user/project/members/)
-* [Create a new merge request](https://docs.gitlab.com/user/project/merge_requests/creating_merge_requests/)
-* [Automatically close issues from merge requests](https://docs.gitlab.com/user/project/issues/managing_issues/#closing-issues-automatically)
-* [Enable merge request approvals](https://docs.gitlab.com/user/project/merge_requests/approvals/)
-* [Set auto-merge](https://docs.gitlab.com/user/project/merge_requests/auto_merge/)
+---
 
-## Test and Deploy
+## Architektur
 
-Use the built-in continuous integration in GitLab.
+```
+HTTP-Webhook  ──►  Processor  ──►  Notifier (voice / sms / email / teams)
+                       │
+              Wartungsfenster-Check
+              Template-Auflösung
+              Wiederhol-Benachrichtigung
+                       │
+                  PostgreSQL
+                       │
+              Vue 3 Frontend (SPA)
+```
 
-* [Get started with GitLab CI/CD](https://docs.gitlab.com/ci/quick_start/)
-* [Analyze your code for known vulnerabilities with Static Application Security Testing (SAST)](https://docs.gitlab.com/user/application_security/sast/)
-* [Deploy to Kubernetes, Amazon EC2, or Amazon ECS using Auto Deploy](https://docs.gitlab.com/topics/autodevops/requirements/)
-* [Use pull-based deployments for improved Kubernetes management](https://docs.gitlab.com/user/clusters/agent/)
-* [Set up protected environments](https://docs.gitlab.com/ci/environments/protected_environments/)
+Weitere Details: [konzept.md](konzept.md)
 
-***
+---
 
-# Editing this README
+## Komponenten
 
-When you're ready to make this README your own, just edit this file and use the handy template below (or feel free to structure it however you want - this is just a starting point!). Thanks to [makeareadme.com](https://www.makeareadme.com/) for this template.
+| Schicht | Technologie |
+|---|---|
+| Backend | Go 1.26, `pgx/v5`, `net/http` |
+| Datenbank | PostgreSQL 15+, Migrationen in `internal/db/migrations/` |
+| Frontend | Vue 3, Vite, Tailwind CSS, Pinia |
+| Sprachausgabe | Asterisk AMI + espeak-ng + sox (offline TTS) |
+| SMS | SMSEAGLE HTTP-API |
+| E-Mail | `net/smtp` gegen internen Smarthost |
+| Teams | Incoming Webhook |
 
-## Suggestions for a good README
+---
 
-Every project is different, so consider which of these sections apply to yours. The sections used in the template are suggestions for most open source projects. Also keep in mind that while a README can be too long and detailed, too long is better than too short. If you think your README is too long, consider utilizing another form of documentation rather than cutting out information.
+## Konfiguration (Umgebungsvariablen)
 
-## Name
-Choose a self-explaining name for your project.
+| Variable | Pflicht | Beschreibung |
+|---|---|---|
+| `DATABASE_URL` | ✓ | PostgreSQL DSN, z.B. `postgres://alarm:pass@localhost/alarmcore` |
+| `ALARM_API_KEY` | — | API-Key für Einlieferer; fehlt → unauthentifiziert (Warnung im Log) |
+| `JWT_SECRET` | — | Geheimnis für JWT-Session-Tokens; wird beim Start autogeneriert falls leer |
+| `LISTEN_ADDR` | — | Bind-Adresse, Default `:8080` |
+| `ASTERISK_HOST` | — | AMI-Adresse, z.B. `127.0.0.1:5038` |
+| `ASTERISK_USER` | — | AMI-Login |
+| `ASTERISK_PASS` | — | AMI-Passwort |
+| `ASTERISK_CHANNEL_TPL` | — | Channel-Template, Default `PJSIP/{number}` |
+| `TTS_ENABLED` | — | `true` aktiviert espeak-ng TTS |
+| `SMSEAGLE_BASE_URL` | — | z.B. `http://smseagle.intern` |
+| `SMSEAGLE_USER` | — | |
+| `SMSEAGLE_PASS` | — | |
+| `SMTP_HOST` | — | z.B. `mailrelay.intern:25` |
+| `SMTP_FROM` | — | Absenderadresse |
+| `TEAMS_WEBHOOK_URL` | — | Incoming-Webhook-URL |
 
-## Description
-Let people know what your project can do specifically. Provide context and add a link to any reference visitors might be unfamiliar with. A list of Features or a Background subsection can also be added here. If there are alternatives to your project, this is a good place to list differentiating factors.
+Kanäle werden nur registriert wenn ihre Haupt-Variable gesetzt ist. Unbekannte Kanäle in Regeln erzeugen eine Log-Warnung, keinen Absturz.
 
-## Badges
-On some READMEs, you may see small images that convey metadata, such as whether or not all the tests are passing for the project. You can use Shields to add some to your README. Many services also have instructions for adding a badge.
+---
 
-## Visuals
-Depending on what you are making, it can be a good idea to include screenshots or even a video (you'll frequently see GIFs rather than actual videos). Tools like ttygif can help, but check out Asciinema for a more sophisticated method.
+## Features (v2.0)
 
-## Installation
-Within a particular ecosystem, there may be a common way of installing things, such as using Yarn, NuGet, or Homebrew. However, consider the possibility that whoever is reading your README is a novice and would like more guidance. Listing specific steps helps remove ambiguity and gets people to using your project as quickly as possible. If it only runs in a specific context like a particular programming language version or operating system or has dependencies that have to be installed manually, also add a Requirements subsection.
+- **Regelwerk** — Source + Keyword + Zeitfenster + Wochentag + Priorität; hot-reload alle 60s
+- **Wartungsfenster** — unterdrücken Alarme zeitgesteuert ohne Regeländerung; optionaler Source/Keyword-Filter
+- **Nachrichten-Templates** — kanalspezifische Texte mit Platzhaltern `{text}` `{source}` `{keyword}` `{time}` `{group}`
+- **Wiederhol-Benachrichtigung** — re-alarmiert bis zur Quittierung, konfigurierbares Intervall und Maximum
+- **Heartbeat-Überwachung** — Dead-Man's-Switch; externe Systeme pingen `/api/heartbeat/{name}`, Ausfall löst Alarm aus
+- **Alarm-Dashboard** — NOC-View mit offenen Alarmen, aktiven Wartungsfenstern und Heartbeat-Status
+- **Statistiken** — Events/Tag (30 Tage), Top-Keywords/-Sources, Kanal-Nutzung
+- **Vollständige OpenAPI-Dokumentation** — Swagger UI unter `/api/docs`, Spec unter `/api/openapi.yaml`
+- **JWT-Auth + API-Keys** — Admin/Viewer-Rollen; API-Keys für maschinelle Einlieferer (bcrypt, Plaintext nur bei Erstellung)
+- **Dark Mode** — Tailwind `dark:`-Varianten, per Button umschaltbar, persistiert in localStorage
+- **Kontexthilfe + Handbuch** — F1 öffnet seitenspezifische Hilfe; vollständiges Handbuch unter `/handbuch`
 
-## Usage
-Use examples liberally, and show the expected output if you can. It's helpful to have inline the smallest example of usage that you can demonstrate, while providing links to more sophisticated examples if they are too long to reasonably include in the README.
+---
 
-## Support
-Tell people where they can go to for help. It can be any combination of an issue tracker, a chat room, an email address, etc.
+## API (Kurzübersicht)
 
-## Roadmap
-If you have ideas for releases in the future, it is a good idea to list them in the README.
+```
+# Events
+POST   /api/events                    # Alarm einliefern (API-Key)
+GET    /api/events                    # Log abrufen (JWT)
 
-## Contributing
-State if you are open to contributions and what your requirements are for accepting them.
+# Quittierung
+POST   /api/acknowledgements          # Quittieren
+GET    /api/acknowledgements?event_id=N
 
-For people who want to make changes to your project, it's helpful to have some documentation on how to get started. Perhaps there is a script that they should run or some environment variables that they need to set. Make these steps explicit. These instructions could also be useful to your future self.
+# Ansagen
+GET    /api/announcements             # Sound-Dateien auflisten
+POST   /api/announcements             # Upload (multipart)
+DELETE /api/announcements/{name}
 
-You can also document commands to lint the code or run tests. These steps help to ensure high code quality and reduce the likelihood that the changes inadvertently break something. Having instructions for running tests is especially helpful if it requires external setup, such as starting a Selenium server for testing in a browser.
+# Wartungsfenster
+GET    /api/maintenance
+POST   /api/maintenance
+PUT    /api/maintenance/{id}
+DELETE /api/maintenance/{id}
 
-## Authors and acknowledgment
-Show your appreciation to those who have contributed to the project.
+# Heartbeats
+GET    /api/heartbeats
+POST   /api/heartbeats
+PUT    /api/heartbeats/{id}
+DELETE /api/heartbeats/{id}
+POST   /api/heartbeat/{name}          # Ping (API-Key)
 
-## License
-For open source projects, say how it is licensed.
+# Templates
+GET    /api/templates
+PUT    /api/templates/{channel}
+DELETE /api/templates/{channel}
 
-## Project status
-If you have run out of energy or time for your project, put a note at the top of the README saying that development has slowed down or stopped completely. Someone may choose to fork your project or volunteer to step in as a maintainer or owner, allowing your project to keep going. You can also make an explicit request for maintainers.
+# Dashboard & Statistiken
+GET    /api/dashboard
+GET    /api/stats
+
+# Regeln, Gruppen, Empfänger, Benutzer, Kanäle, API-Keys
+# → vollständig unter /api/docs (Swagger UI)
+
+# Authentifizierung
+POST   /api/login
+POST   /api/logout
+
+# Health
+GET    /health
+```
+
+---
+
+## Deployment (Produktion, Debian 13)
+
+```bash
+cd deploy
+sudo bash setup.sh
+```
+
+`setup.sh` ist ein interaktiver Assistent der alle Optionen abfragt und die drei Install-Scripts (`install-postgres.sh`, `install-asterisk.sh`, `install-alarm-core.sh`) aufruft.
+
+**Wichtig:** Asterisk wird aus dem Quellcode gebaut — das Debian-13-Paket existiert in main nicht mehr.
+
+---
+
+## Repo-Struktur
+
+```
+alarmserver/
+├── cmd/alarm-core/main.go          — Wiring + HTTP-Server
+├── internal/
+│   ├── core/                       — Interfaces, RuleEngine, Processor
+│   ├── db/                         — PostgreSQL-Stores + migrations/
+│   ├── api/                        — HTTP-Handler
+│   ├── notify/                     — asterisk / smseagle / email / teams
+│   └── tts/espeak/                 — Offline-TTS
+├── frontend/                       — Vue 3 + Vite + Tailwind
+├── deploy/                         — Installations-Scripts + systemd-Unit
+└── konzept.md                      — Vollständige technische Dokumentation
+```
+
+---
+
+## Kontakt / Intern
+
+Projekt: `github.com/bh2005/alarmserver`
+Ansprechpartner: noreply@example.com

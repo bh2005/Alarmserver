@@ -1,731 +1,492 @@
-# Alarm-Core: Konzept für ein mandantenfähiges Alarmierungssystem
+# Alarm-Core: Konzept eines mandantenfähigen, kanalunabhängigen Alarmierungssystems
 
-**Version:** 0.3  
-**Stand:** Juni 2026  
-**Zielgruppe:** Freiwillige Feuerwehren, BOS-Einheiten
+**Version:** 2.0
+**Stand:** Juni 2026
+**Hinweis:** Dieses Dokument ersetzt Version 1.0. In Version 2.0 wurden Wartungsfenster, Nachrichten-Templates, Wiederhol-Benachrichtigung, ein Alarm-Dashboard (NOC View), Heartbeat-Überwachung, Statistiken und eine vollständige OpenAPI-Dokumentation ergänzt.
 
 ---
 
 ## 1. Zielsetzung
 
-Dieses Dokument beschreibt die Architektur eines modularen Alarmierungssystems für Freiwillige Feuerwehren. Das System soll:
-
-- Alarme aus verschiedenen Eingangskanälen (Leitstelle, DME, manuell) empfangen und normalisieren
-- Einsatzkräfte anhand konfigurierbarer Regeln und Zeitpläne alarmieren
-- Tages- und Nachtschleifen sowie Wochenend-Logik abbilden
-- Ausfallsicher und ohne manuelle Code-Änderungen administrierbar sein
+Alarm-Core empfängt Events aus einem Eingangskanal, matched sie gegen ein admin-konfigurierbares Regelwerk (Zeitfenster, Wochentag, Priorität) und alarmiert die passende Zielgruppe über einen oder mehrere austauschbare Notification-Kanäle (Telefonanruf, SMS, E-Mail, Microsoft Teams). Wartungsfenster unterdrücken planbar Alarme ohne Regeländerung. Heartbeats überwachen externe Systeme nach dem Dead-Man's-Switch-Prinzip. Alle Vorgänge werden vollständig auditiert. Kein Stichwort/keine Regel ist im Code hartkodiert — alles läuft über PostgreSQL-Tabellen.
 
 ---
 
 ## 2. Architekturübersicht
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                        Eingangskanäle                       │
-│   REST-API │  IMAP/E-Mail  │  DME/Seriell (/dev/ttyUSB0)   │
-└──────────────────────┬──────────────────────────────────────┘
-                       │ normalisierter Alarm-Event
-                       ▼
-┌─────────────────────────────────────────────────────────────┐
-│                       Alarm-Core (Go)                       │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────┐  │
-│  │  Regel-Engine │  │  Scheduler   │  │   Audit-Logger   │  │
-│  └──────┬───────┘  └──────┬───────┘  └──────────────────┘  │
-│         └────────┬─────────┘                                │
-└──────────────────┼──────────────────────────────────────────┘
-                   │ aufgelöste Zielgruppe + Kanäle
-                   ▼
-┌─────────────────────────────────────────────────────────────┐
-│                      Ausgangskanäle                         │
-│        Asterisk (SIP/VoIP)  │  SMSEAGLE (SMS)              │
-└─────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────┐
+│                         Eingangskanäle                              │
+│   POST /api/events (HTTP-Webhook)  │  Heartbeat-Checker (intern)   │
+└────────────────────┬────────────────────────────┬───────────────────┘
+                     │ core.Event                  │ core.Event (HB-Ausfall)
+                     ▼                             ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                      alarm-core (Go, ein Binary)                    │
+│                                                                     │
+│  ┌─────────────┐  ┌───────────────────────────────────────────────┐ │
+│  │ RuleEngine  │  │                  Processor                    │ │
+│  │ (in-memory, │──│  1. Wartungsfenster-Check (MaintenanceChecker)│ │
+│  │ Reload 60s) │  │  2. Rule-Match (RuleEngine)                   │ │
+│  └─────────────┘  │  3. Template auflösen (TemplateLoader)        │ │
+│                   │  4. dispatch() → Notifier                     │ │
+│                   │  5. repeatNotify() Goroutine (opt.)           │ │
+│                   └───────────────────────────────────────────────┘ │
+│                                          │                          │
+│  ┌─────────────┐  ┌──────────────┐       │ core.Notifier           │
+│  │  AuditWriter│  │ HeartbeatChk │       ▼                         │
+│  │ (event_log, │  │ Goroutine    │  ┌─────────────────────────────┐│
+│  │ acks)       │  │ (Ticker 60s) │  │  asterisk  sms  email  teams││
+│  └─────────────┘  └──────────────┘  └─────────────────────────────┘│
+└─────────────────────────────────────────────────────────────────────┘
+                              │
+                    ┌─────────▼──────────┐
+                    │   PostgreSQL        │
+                    │  (alle Tabellen)    │
+                    └────────────────────┘
+                              │
+                    ┌─────────▼──────────┐
+                    │  Vue 3 Frontend     │
+                    │  (Tailwind, Pinia)  │
+                    └────────────────────┘
 ```
 
-**Kernprinzip:** Kein Eingangskanal kennt die Ausgangslogik. Kein Ausgangskanal kennt die Regellogik. Der Alarm-Core ist der einzige Ort, an dem beides zusammenkommt. Der Logging-Layer ist vollständig vom Core entkoppelt und bedient zwei getrennte Zielgruppen: Administratoren (technisch) und Vorgesetzte (fachlich).
+**Kernprinzip:** Der Core kennt keine kanalspezifischen Details. `core.Notifier` ist das einzige Interface, über das Ausgangskanäle angesprochen werden. Ein Ausfall eines Kanals blockiert die anderen nicht.
 
 ---
 
 ## 3. Datenmodell (PostgreSQL)
 
-### 3.1 Einsatzkräfte
+Migrationen liegen unter `internal/db/migrations/`, getrackt über eine `schema_migrations`-Tabelle (idempotent, jede Datei einzeln).
+
+### 3.1 `recipients`, `groups`, `group_members`
 
 ```sql
-CREATE TABLE einsatzkraefte (
+CREATE TABLE recipients (
     id          SERIAL PRIMARY KEY,
-    vorname     VARCHAR(100) NOT NULL,
-    nachname    VARCHAR(100) NOT NULL,
-    rufnummer   VARCHAR(30),           -- für SIP-Anruf
-    mobilnummer VARCHAR(30),           -- für SMS
-    aktiv       BOOLEAN NOT NULL DEFAULT TRUE,
-    erstellt_am TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    first_name  VARCHAR(100) NOT NULL,
+    last_name   VARCHAR(100) NOT NULL,
+    voice       VARCHAR(30),
+    mobile      VARCHAR(30),
+    email       VARCHAR(255),
+    active      BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE groups (
+    id          SERIAL PRIMARY KEY,
+    name        VARCHAR(100) NOT NULL UNIQUE,
+    description TEXT
+);
+
+CREATE TABLE group_members (
+    group_id     INT NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+    recipient_id INT NOT NULL REFERENCES recipients(id) ON DELETE CASCADE,
+    PRIMARY KEY (group_id, recipient_id)
 );
 ```
 
-### 3.2 Einsatzgruppen
-
-Eine Person kann mehreren Gruppen angehören (z. B. *Atemschutz* und *Führung*).
+### 3.2 `rules` — das Regelwerk
 
 ```sql
-CREATE TABLE einsatzgruppen (
+CREATE TABLE rules (
+    id                  SERIAL PRIMARY KEY,
+    source              VARCHAR(50)  NOT NULL,
+    keyword             VARCHAR(100) NOT NULL,
+    start_hour          SMALLINT,
+    end_hour            SMALLINT,
+    weekdays_only       BOOLEAN NOT NULL DEFAULT FALSE,
+    target_group_id     INT NOT NULL REFERENCES groups(id),
+    channels            TEXT[] NOT NULL,
+    priority            SMALLINT NOT NULL DEFAULT 10,
+    active              BOOLEAN NOT NULL DEFAULT TRUE,
+    require_ack         BOOLEAN NOT NULL DEFAULT FALSE,
+    -- Wiederhol-Benachrichtigung (v2.0)
+    repeat_interval_sec INT NOT NULL DEFAULT 0,  -- 0 = deaktiviert
+    repeat_max          INT NOT NULL DEFAULT 3
+);
+```
+
+### 3.3 `event_log` — Audit-Log
+
+```sql
+CREATE TABLE event_log (
+    id            SERIAL PRIMARY KEY,
+    received_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    source        VARCHAR(50)  NOT NULL,
+    keyword       VARCHAR(100) NOT NULL,
+    raw_payload   JSONB,
+    rule_id       INT REFERENCES rules(id),
+    target_group  VARCHAR(100),
+    channels      TEXT[],
+    status        VARCHAR(20) NOT NULL DEFAULT 'DISPATCHED',
+    -- Status: DISPATCHED | ERROR | NO_MATCH | MAINTENANCE
+    error_detail  TEXT
+);
+```
+
+### 3.4 `acknowledgements` — Quittierung
+
+```sql
+CREATE TABLE acknowledgements (
+    id              SERIAL PRIMARY KEY,
+    event_log_id    INT NOT NULL REFERENCES event_log(id) ON DELETE CASCADE,
+    recipient_id    INT NOT NULL REFERENCES recipients(id),
+    response        VARCHAR(12) NOT NULL,  -- 'COMING' | 'NOT_COMING' | 'LATER'
+    channel         VARCHAR(10),
+    acknowledged_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (event_log_id, recipient_id)
+);
+```
+
+### 3.5 `maintenance_windows` — Wartungsfenster (v2.0)
+
+```sql
+CREATE TABLE maintenance_windows (
+    id         SERIAL PRIMARY KEY,
+    label      VARCHAR(200) NOT NULL,
+    starts_at  TIMESTAMPTZ NOT NULL,
+    ends_at    TIMESTAMPTZ NOT NULL,
+    source     VARCHAR(50),   -- NULL = alle Sources
+    keyword    VARCHAR(100),  -- NULL = alle Keywords
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+```
+
+Während eines aktiven Wartungsfensters werden matchende Events mit Status `MAINTENANCE` ins Audit-Log geschrieben und **nicht** alarmiert. `source`/`keyword` NULL bedeutet "trifft alle" (globales Fenster).
+
+### 3.6 `heartbeats` — Heartbeat-Überwachung (v2.0)
+
+```sql
+CREATE TABLE heartbeats (
     id           SERIAL PRIMARY KEY,
-    name         VARCHAR(100) NOT NULL UNIQUE, -- z.B. "Loeschzug_Tag", "AGT", "Wehrfuehrung"
-    beschreibung TEXT
-);
-
--- M:N-Verknüpfung Personen ↔ Gruppen
-CREATE TABLE gruppen_mitglieder (
-    gruppe_id INT NOT NULL REFERENCES einsatzgruppen(id) ON DELETE CASCADE,
-    person_id INT NOT NULL REFERENCES einsatzkraefte(id) ON DELETE CASCADE,
-    PRIMARY KEY (gruppe_id, person_id)
+    name         VARCHAR(100) NOT NULL UNIQUE,
+    description  TEXT,
+    interval_sec INT NOT NULL DEFAULT 300,   -- erwartetes Ping-Intervall
+    grace_sec    INT NOT NULL DEFAULT 60,    -- Toleranz nach Ablauf
+    source       VARCHAR(50)  NOT NULL,      -- für die Alarm-Regel
+    keyword      VARCHAR(100) NOT NULL,
+    last_seen    TIMESTAMPTZ,
+    alerted_at   TIMESTAMPTZ,               -- wann zuletzt alarmiert
+    active       BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 ```
 
-### 3.3 Regelwerk (Routing-Tabelle)
+Externe Systeme pingen `POST /api/heartbeat/{name}`. Eine Goroutine prüft alle 60s, ob Heartbeats überfällig sind und schreibt ggf. einen `core.Event` in den Event-Channel (löst normale Regelverarbeitung aus).
 
-Das Herzstück des Systems. Jede Zeile definiert eine "Wenn–Dann"-Bedingung. Keine Regel = kein Code-Deployment.
+### 3.7 `message_templates` — Nachrichten-Templates (v2.0)
 
 ```sql
-CREATE TABLE alarm_regeln (
-    id             SERIAL PRIMARY KEY,
-    trigger_quelle VARCHAR(50)  NOT NULL, -- z.B. "LEITSTELLEN_API", "DME_SCANNER", "MANUELL"
-    stichwort      VARCHAR(100) NOT NULL, -- z.B. "F 2", "H 1", "B MITTEL"
-    -- Zeitfenster: NULL = gilt immer
-    start_stunde   SMALLINT,              -- 0–23, NULL = kein Limit
-    end_stunde     SMALLINT,              -- 0–23, NULL = kein Limit
-    nur_werktags   BOOLEAN NOT NULL DEFAULT FALSE,
-    ziel_gruppe_id INT NOT NULL REFERENCES einsatzgruppen(id),
-    kanaele        TEXT[] NOT NULL,       -- z.B. ARRAY['SIP', 'SMS']
-    prioritaet     SMALLINT NOT NULL DEFAULT 10, -- niedrigere Zahl = höhere Prio
-    aktiv          BOOLEAN NOT NULL DEFAULT TRUE
-);
-
--- Index für schnelles Matching beim Alarm-Eingang
-CREATE INDEX idx_regeln_lookup ON alarm_regeln (trigger_quelle, stichwort, aktiv);
-```
-
-**Beispiel-Datensätze:**
-
-| Quelle | Stichwort | Zeitfenster | Nur Werktags | Ziel-Gruppe | Kanäle |
-|---|---|---|---|---|---|
-| `LEITSTELLEN_API` | `F 2` | 06:00–17:00 | Ja | `Zug_Mitte` + `FF_Nachbarort` | SIP, SMS |
-| `LEITSTELLEN_API` | `F 2` | 17:00–06:00 / WE | Nein | `Zug_Mitte_Vollalarm` | SIP, SMS |
-| `DME_SCANNER` | `H 1` | — | Nein | `Kleinschleife_Technik` | SMS |
-| `MANUELL` | `INTERN` | — | Nein | `Wehrfuehrung` | SIP |
-
-### 3.4 Audit-Log
-
-Jeder Alarm wird vollständig protokolliert – für Nachbesprechungen und rechtliche Absicherung.
-
-```sql
-CREATE TABLE alarm_log (
-    id             SERIAL PRIMARY KEY,
-    eingang_um     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    trigger_quelle VARCHAR(50)  NOT NULL,
-    stichwort      VARCHAR(100) NOT NULL,
-    roh_payload    JSONB,                -- Original-Daten des Eingangskanals
-    regel_id       INT REFERENCES alarm_regeln(id),
-    ziel_gruppe    VARCHAR(100),
-    kanaele        TEXT[],
-    status         VARCHAR(20) NOT NULL DEFAULT 'AUSGELOEST', -- AUSGELOEST | FEHLER | KEIN_TREFFER
-    fehler_detail  TEXT
+CREATE TABLE message_templates (
+    channel    VARCHAR(50) PRIMARY KEY,  -- 'voice', 'sms', 'email', 'teams'
+    template   TEXT NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 ```
 
----
-
-## 4. Trigger-Engine (Eingangskanäle)
-
-Jeder Eingangskanal ist ein eigenständiger **Worker** (Go-Goroutine), der seinen Input auf einen einheitlichen `AlarmEvent`-Typ normalisiert und an den Core weitergibt.
-
-```go
-// Gemeinsamer Typ für alle Eingangskanäle
-type AlarmEvent struct {
-    Quelle    string          // "LEITSTELLEN_API", "DME_SCANNER", "MANUELL"
-    Stichwort string          // "F 2", "H 1", ...
-    Klartext  string          // Freitext des Alarms (für Anzeige/Log)
-    Eingang   time.Time
-    RohDaten  json.RawMessage // Original-Payload für den Audit-Log
-}
-```
-
-### 4.1 HTTP REST API
-
-Für moderne Einsatzleitrechner (ELR) oder Systeme wie Divera/GroupAlarm.
-
-```go
-func (s *Server) handleAlarmWebhook(w http.ResponseWriter, r *http.Request) {
-    var payload struct {
-        Stichwort string `json:"stichwort"`
-        Klartext  string `json:"klartext"`
-    }
-    if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
-        http.Error(w, "ungültiger Body", http.StatusBadRequest)
-        return
-    }
-    event := AlarmEvent{
-        Quelle:    "LEITSTELLEN_API",
-        Stichwort: payload.Stichwort,
-        Klartext:  payload.Klartext,
-        Eingang:   time.Now(),
-    }
-    s.alarmChan <- event
-    w.WriteHeader(http.StatusAccepted)
-}
-```
-
-### 4.2 IMAP / E-Mail
-
-Viele Leitstellen senden Alarme parallel als strukturierte E-Mail. Ein Hintergrunddienst pollt das Postfach und parst den Text per RegEx.
-
-```go
-func (w *ImapWorker) Run(alarmChan chan<- AlarmEvent) {
-    ticker := time.NewTicker(15 * time.Second)
-    for range ticker.C {
-        mails, err := w.fetchUnread()
-        if err != nil {
-            log.Printf("[IMAP] Fehler beim Abruf: %v", err)
-            continue
-        }
-        for _, mail := range mails {
-            stichwort := parseStichwort(mail.Body) // RegEx auf Leitstellen-Format
-            if stichwort == "" {
-                continue
-            }
-            alarmChan <- AlarmEvent{
-                Quelle:    "IMAP",
-                Stichwort: stichwort,
-                Klartext:  mail.Body,
-                Eingang:   time.Now(),
-            }
-        }
-    }
-}
-```
-
-### 4.3 DME / Seriell
-
-Ein USB-Funkscanner oder Pager-Cradle (z. B. Boss 915/935) gibt Textdaten über `/dev/ttyUSB0` aus.
-
-```go
-func (w *SerialWorker) Run(alarmChan chan<- AlarmEvent) {
-    port, err := serial.Open("/dev/ttyUSB0", &serial.Mode{BaudRate: 9600})
-    if err != nil {
-        log.Fatalf("[SERIAL] Port nicht verfügbar: %v", err)
-    }
-    scanner := bufio.NewScanner(port)
-    for scanner.Scan() {
-        line := strings.TrimSpace(scanner.Text())
-        if stichwort := parsePagerZeile(line); stichwort != "" {
-            alarmChan <- AlarmEvent{
-                Quelle:    "DME_SCANNER",
-                Stichwort: stichwort,
-                Klartext:  line,
-                Eingang:   time.Now(),
-            }
-        }
-    }
-}
-```
+Unterstützte Platzhalter: `{text}`, `{source}`, `{keyword}`, `{time}`, `{group}`. Fehlt ein Template für einen Kanal, wird `event.Text` unverändert verwendet (Rückwärtskompatibilität).
 
 ---
 
-## 5. Regel-Engine (Routing-Logik)
-
-Die Regel-Engine lädt die `alarm_regeln`-Tabelle beim Start in den Arbeitsspeicher und hält sie per periodischem Reload aktuell. **Keine Stichwörter sind im Code hartkodiert.**
+## 4. Eingangskanal
 
 ```go
-type AlarmRegel struct {
-    ID           int
-    TriggerQuelle string
-    Stichwort    string
-    StartStunde  *int    // nil = kein Limit
-    EndStunde    *int
-    NurWerktags  bool
-    ZielGruppe   string
-    Kanaele      []string
-    Prioritaet   int
-}
-
-func (e *RegelEngine) FindePassendeRegel(event AlarmEvent) (*AlarmRegel, error) {
-    jetzt := event.Eingang
-    stunde := jetzt.Hour()
-    istWerktag := jetzt.Weekday() >= time.Monday && jetzt.Weekday() <= time.Friday
-
-    var treffer []AlarmRegel
-    for _, regel := range e.regeln {
-        if regel.TriggerQuelle != event.Quelle || regel.Stichwort != event.Stichwort {
-            continue
-        }
-        if regel.NurWerktags && !istWerktag {
-            continue
-        }
-        if regel.StartStunde != nil && stunde < *regel.StartStunde {
-            continue
-        }
-        if regel.EndStunde != nil && stunde >= *regel.EndStunde {
-            continue
-        }
-        treffer = append(treffer, regel)
-    }
-
-    if len(treffer) == 0 {
-        return nil, fmt.Errorf("keine Regel für Quelle=%s Stichwort=%s", event.Quelle, event.Stichwort)
-    }
-
-    // Höchste Priorität gewinnt (niedrigster Wert)
-    sort.Slice(treffer, func(i, j int) bool {
-        return treffer[i].Prioritaet < treffer[j].Prioritaet
-    })
-    return &treffer[0], nil
+type Event struct {
+    Source     string
+    Keyword    string
+    Text       string
+    ReceivedAt time.Time
+    RawPayload json.RawMessage
 }
 ```
 
-> **Hinweis zur Zeitlogik:** Das Zeitfenster wird als `[StartStunde, EndStunde)` behandelt – d. h. `start=6, end=17` gilt von 06:00:00 bis 16:59:59. Stunde 17 ist bereits Nacht.
+`POST /api/events` mit `{"keyword": "...", "text": "..."}` normalisiert auf `Source = "WEBHOOK"` und legt das Event in einen gepufferten Channel (Kapazität 100). Bei vollem Puffer: `503`.
+
+### 4.1 Authentifizierung
+
+`/api/events`, `/api/announcements`, `/api/acknowledgements` und `/api/heartbeat/{name}` verlangen einen API-Key als `Authorization: Bearer <key>` oder `X-API-Key: <key>` Header. Vergleich constant-time (`crypto/subtle`). Alle übrigen `/api/...`-Endpoints verlangen einen gültigen JWT-Session-Token (Login via `/api/login`). `/health` bleibt offen.
 
 ---
 
-## 6. Ausgangskanäle (Telefonie & SMS)
+## 5. Processor (Kernlogik)
 
-### 6.1 Asterisk (SIP/VoIP) via AMI
-
-Der Alarm-Core spricht mit Asterisk über das **Asterisk Manager Interface (AMI)**. Dabei wird pro Zielperson ein `Originate`-Kommando abgesetzt, das einen ausgehenden Anruf auslöst und bei Verbindung eine Sprachdurchsage (`.wav`/Text-to-Speech) abspielt.
+Der `Processor` implementiert drei pluggable Interfaces:
 
 ```go
-func (a *AsteriskClient) RufeAn(rufnummer string, ansage string) error {
-    cmd := fmt.Sprintf(
-        "Action: Originate\r\n"+
-        "Channel: SIP/%s\r\n"+
-        "Application: Playback\r\n"+
-        "Data: %s\r\n"+
-        "Timeout: 30000\r\n\r\n",
-        rufnummer, ansage,
-    )
-    _, err := a.conn.Write([]byte(cmd))
-    return err
+type MaintenanceChecker interface {
+    IsUnderMaintenance(ctx, source, keyword string, at time.Time) (bool, error)
+}
+type TemplateLoader interface {
+    GetTemplate(ctx, channel string) (string, error)
+}
+type AckStatusChecker interface {
+    IsAcknowledged(ctx, eventLogID int) (bool, error)
 }
 ```
 
-### 6.2 SMSEAGLE (SMS)
+**Verarbeitungsreihenfolge pro Event:**
 
-SMSEAGLE bietet eine REST-API für den SMS-Versand.
+1. `MaintenanceChecker.IsUnderMaintenance()` — trifft ein Fenster: `MAINTENANCE`-Log, return
+2. `RuleEngine.FindMatchingRule()` — kein Match: `NO_MATCH`-Log, return
+3. `AuditWriter.LogEvent()` — schreibt `event_log`-Eintrag
+4. Pro Kanal: `TemplateLoader.GetTemplate()` → Platzhalter ersetzen → `Notifier.Notify()`
+5. Bei `repeat_interval_sec > 0`: `repeatNotify()` Goroutine starten
 
-```go
-func (s *SmseagleClient) SendeSMS(nummer string, text string) error {
-    url := fmt.Sprintf(
-        "%s/index.php/http_api/send_sms?login=%s&pass=%s&to=%s&message=%s",
-        s.BaseURL, s.Login, s.Passwort,
-        url.QueryEscape(nummer),
-        url.QueryEscape(text),
-    )
-    resp, err := http.Get(url)
-    if err != nil {
-        return err
-    }
-    defer resp.Body.Close()
-    if resp.StatusCode != http.StatusOK {
-        return fmt.Errorf("SMSEAGLE Fehler: HTTP %d", resp.StatusCode)
-    }
-    return nil
-}
-```
-
----
-
-## 7. Ausfallsicherheit
-
-Ein Alarmierungssystem muss im schlimmsten Moment funktionieren.
-
-### 7.1 Datenbankausfall
-
-Regeln werden beim Start in den Speicher geladen. Ist die DB beim Alarm-Eingang nicht erreichbar, arbeitet der Core mit dem zuletzt bekannten Stand weiter.
+### 5.1 Wiederhol-Benachrichtigung
 
 ```go
-func (e *RegelEngine) StarteHintergrundReload(intervall time.Duration) {
-    go func() {
-        for range time.NewTicker(intervall).C {
-            neueRegeln, err := e.db.LadeAlleRegeln()
-            if err != nil {
-                log.Printf("[RegelEngine] Reload fehlgeschlagen, behalte alten Stand: %v", err)
-                continue // KEIN Überschreiben bei Fehler
-            }
-            e.mu.Lock()
-            e.regeln = neueRegeln
-            e.mu.Unlock()
+func (p *Processor) repeatNotify(ctx, eventLogID, rule, event) {
+    for i := 0; i < min(rule.RepeatMax, 10); i++ {
+        time.Sleep(rule.RepeatIntervalSec)
+        if acked, _ := p.AckChecker.IsAcknowledged(ctx, eventLogID); acked {
+            return  // quittiert — Stop
         }
-    }()
+        p.dispatch(ctx, rule, event)
+    }
 }
 ```
 
-### 7.2 Watchdog / Health-Check
+Maximale Wiederholungen: `min(RepeatMax, 10)` (Schutz vor Endlosschleifen).
 
-Ein HTTP-Endpunkt `/health` meldet den Status aller Subsysteme. Externe Überwachung (z. B. Prometheus/Alertmanager oder ein einfaches Bash-Cron-Script) kann darauf aufsetzt.
+---
+
+## 6. Regel-Engine
 
 ```go
-func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
-    status := map[string]string{
-        "db":        s.db.Ping(),       // "ok" oder Fehlermeldung
-        "asterisk":  s.ami.Ping(),
-        "smseagle":  s.sms.Ping(),
-        "serial":    s.serial.Status(),
-    }
-    w.Header().Set("Content-Type", "application/json")
-    json.NewEncoder(w).Encode(status)
+func (e *RuleEngine) FindMatchingRule(event Event) (*Rule, error) {
+    // source + keyword exakt
+    // weekdays_only: Mo-Fr per time.Weekday()
+    // [start_hour, end_hour): halboffenes Intervall
+    // Bei mehreren Treffern: niedrigster Priority-Wert
 }
 ```
 
----
+**Bekannte Lücke:** Zeitfenster über Mitternacht (`start=17, end=6`) matcht nie — zwei Regeln als Workaround.
 
-## 8. Logging
-
-Das System unterscheidet strikt zwischen zwei Log-Schichten mit unterschiedlichen Zielgruppen, Formaten und Aufbewahrungsfristen.
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                       Alarm-Core                            │
-│                          │                                  │
-│          ┌───────────────┴───────────────┐                  │
-│          ▼                               ▼                  │
-│   System-Logger                   Fach-Logger               │
-│   (structured JSON                (PostgreSQL-              │
-│    → journald)                     Tabellen)                │
-└──────────┬────────────────────────────┬──────────────────── ┘
-           │                            │
-           ▼                            ▼
-     Admin-Sicht                  Führungs-Sicht
-  (Check_MK, Logfile)          (Auswertungs-Queries,
-                                 späteres Web-UI)
-```
+**Ausfallsicherheit:** `Reload()` alle 60s; DB-Fehler → letzter bekannter Regelsatz bleibt unverändert.
 
 ---
 
-### 8.1 System-Logging (Admin-Sicht)
+## 7. Notifier (Ausgangskanäle)
 
-Das System-Logging erfasst den **technischen Betriebszustand**: Worker-Status, Verbindungsfehler, Latenzen, Regel-Reload. Es schreibt strukturiertes JSON an `stdout` / `stderr`, wird von `systemd` via `journald` erfasst und von Check_MK ausgewertet (siehe Kapitel 9).
+```go
+type Notifier interface {
+    Channel() string  // "voice" | "sms" | "email" | "teams"
+    Notify(ctx context.Context, recipients []Recipient, message string) error
+}
+```
 
-**Log-Level-Konzept:**
+Registrierung in `main.go` ist Env-Var-getrieben: fehlt die Haupt-Variable, wird der Notifier nicht angelegt. Unbekannte Kanäle in `rules.channels` erzeugen nur eine Warnung.
 
-| Level | Wann | Beispiel |
+| Kanal | Impl | Details |
 |---|---|---|
-| `DEBUG` | Nur im Entwicklungsbetrieb | Eingehende Zeile am seriellen Port |
-| `INFO` | Normalbetrieb, jeder Alarm-Eingang | Alarm ausgelöst, Regel getroffen |
-| `WARN` | Degradierter Betrieb, aber funktionsfähig | DB-Reload fehlgeschlagen, arbeite mit Cache |
-| `ERROR` | Funktionsverlust an einem Kanal | Asterisk AMI nicht erreichbar |
-| `FATAL` | System nicht startbar | Kein DB-Connect beim Start |
-
-**Go-Implementierung (strukturiertes JSON-Logging mit `log/slog`):**
-
-```go
-import "log/slog"
-
-// Initialisierung: JSON-Handler für journald-kompatible Ausgabe
-logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
-    Level: slog.LevelInfo,
-}))
-slog.SetDefault(logger)
-
-// Beispiele im Betrieb:
-slog.Info("alarm_eingegangen",
-    "quelle",    event.Quelle,
-    "stichwort", event.Stichwort,
-    "eingang",   event.Eingang.Format(time.RFC3339),
-)
-
-slog.Error("asterisk_nicht_erreichbar",
-    "host",    a.Host,
-    "fehler",  err.Error(),
-    "versuch", versuch,
-)
-
-slog.Warn("regel_reload_fehlgeschlagen",
-    "fehler",       err.Error(),
-    "cache_alter_s", time.Since(e.letzterReload).Seconds(),
-)
-```
-
-**Beispiel-Ausgabe (journald):**
-```json
-{"time":"2026-06-12T02:14:55Z","level":"INFO","msg":"alarm_eingegangen","quelle":"DME_SCANNER","stichwort":"F 2","eingang":"2026-06-12T02:14:55Z"}
-{"time":"2026-06-12T02:14:55Z","level":"INFO","msg":"regel_getroffen","regel_id":3,"ziel_gruppe":"Zug_Mitte_Vollalarm","kanaele":["SIP","SMS"]}
-{"time":"2026-06-12T02:14:56Z","level":"INFO","msg":"sip_anruf_gestartet","rufnummer":"+49561...","person_id":12}
-{"time":"2026-06-12T02:14:58Z","level":"ERROR","msg":"sms_versand_fehlgeschlagen","person_id":7,"fehler":"HTTP 503"}
-```
-
-**Log-Rotation (logrotate):**
-```
-/var/log/alarm-core/*.log {
-    daily
-    rotate 30
-    compress
-    missingok
-    notifempty
-    postrotate
-        systemctl kill -s HUP alarm-core.service
-    endscript
-}
-```
+| `voice` | Asterisk AMI | `Originate` pro Empfänger; TTS via espeak-ng+sox (offline, `TTS_ENABLED=true`); WAV-Cleanup nach 90s verzögert |
+| `sms` | SMSEAGLE HTTP-API | Ein Request pro Empfänger |
+| `email` | `net/smtp` | Ein Mail an alle Empfänger; typisch gegen internen Smarthost |
+| `teams` | Incoming Webhook | `{"text":"..."}` an Kanal; `recipients`-Liste wird ignoriert |
 
 ---
 
-### 8.2 Fachliches Logging / Auswertung (Führungs-Sicht)
+## 8. Quittierung
 
-Vorgesetzte benötigen keine Systemmetriken, sondern Antworten auf operative Fragen: Wer wurde wann alarmiert? Wie viele sind gekommen? Welche Stichwörter dominieren?
-
-Das fachliche Logging schreibt ausschließlich in die PostgreSQL-Datenbank.
-
-#### Datenmodell-Erweiterungen
-
-```sql
--- Detaillierte Protokollierung pro alarmierter Person
-CREATE TABLE alarm_zustellungen (
-    id             SERIAL PRIMARY KEY,
-    alarm_log_id   INT NOT NULL REFERENCES alarm_log(id) ON DELETE CASCADE,
-    person_id      INT NOT NULL REFERENCES einsatzkraefte(id),
-    kanal          VARCHAR(10) NOT NULL,  -- 'SIP' oder 'SMS'
-    gesendet_um    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    status         VARCHAR(20) NOT NULL,  -- 'GESENDET' | 'FEHLGESCHLAGEN' | 'KEINE_NUMMER'
-    fehler_detail  TEXT
-);
-
--- Quittierungen (Rückmeldungen der Kameraden)
-CREATE TABLE quittierungen (
-    id           SERIAL PRIMARY KEY,
-    alarm_log_id INT NOT NULL REFERENCES alarm_log(id) ON DELETE CASCADE,
-    person_id    INT NOT NULL REFERENCES einsatzkraefte(id),
-    antwort      VARCHAR(10) NOT NULL,  -- 'KOMME' | 'KOMME_NICHT' | 'SPAETER'
-    quittiert_um TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    kanal        VARCHAR(10),           -- über welchen Kanal quittiert wurde
-    UNIQUE (alarm_log_id, person_id)
-);
-
--- Indizes für schnelle Auswertungsabfragen
-CREATE INDEX idx_zustellungen_alarm  ON alarm_zustellungen (alarm_log_id);
-CREATE INDEX idx_quittierungen_alarm ON quittierungen (alarm_log_id);
-CREATE INDEX idx_alarm_log_eingang   ON alarm_log (eingang_um DESC);
+```
+POST /api/acknowledgements  {"event_id", "recipient_id", "response", "channel"}
+GET  /api/acknowledgements?event_id=N
 ```
 
-#### Auswertungs-Queries für Vorgesetzte
-
-**Alarmaufkommen der letzten 12 Monate nach Stichwort:**
-```sql
-SELECT
-    stichwort,
-    COUNT(*)                                        AS anzahl_alarme,
-    ROUND(AVG(EXTRACT(HOUR FROM eingang_um)), 1)    AS mittl_uhrzeit
-FROM alarm_log
-WHERE eingang_um >= NOW() - INTERVAL '12 months'
-  AND status = 'AUSGELOEST'
-GROUP BY stichwort
-ORDER BY anzahl_alarme DESC;
-```
-
-**Verfügbarkeitsquote pro Kamerad (laufendes Jahr):**
-```sql
-SELECT
-    e.nachname || ', ' || e.vorname              AS name,
-    COUNT(DISTINCT q.alarm_log_id)               AS quittierungen_gesamt,
-    COUNT(*) FILTER (WHERE q.antwort = 'KOMME')  AS zugesagt,
-    ROUND(
-        100.0 * COUNT(*) FILTER (WHERE q.antwort = 'KOMME')
-        / NULLIF(COUNT(DISTINCT q.alarm_log_id), 0), 1
-    )                                            AS verfuegbarkeit_pct
-FROM einsatzkraefte e
-LEFT JOIN quittierungen q ON q.person_id = e.id
-LEFT JOIN alarm_log     a ON a.id = q.alarm_log_id
-    AND a.eingang_um >= DATE_TRUNC('year', NOW())
-WHERE e.aktiv = TRUE
-GROUP BY e.id, e.nachname, e.vorname
-ORDER BY verfuegbarkeit_pct DESC NULLS LAST;
-```
-
-**Alarmdetail-Protokoll (Nachbesprechung eines einzelnen Einsatzes):**
-```sql
-SELECT
-    e.nachname || ', ' || e.vorname  AS kamerad,
-    z.kanal,
-    z.gesendet_um,
-    z.status                         AS zustellung,
-    q.antwort                        AS quittierung,
-    q.quittiert_um
-FROM alarm_zustellungen z
-JOIN einsatzkraefte e ON e.id = z.person_id
-LEFT JOIN quittierungen q
-    ON q.person_id = z.person_id AND q.alarm_log_id = z.alarm_log_id
-WHERE z.alarm_log_id = :alarm_id   -- Parameter: konkrete Alarm-ID
-ORDER BY e.nachname, e.vorname;
-```
+Kanalunabhängig. Upsert per `(event_log_id, recipient_id)`. `response`: `COMING` | `NOT_COMING` | `LATER`.
 
 ---
 
-## 9. Monitoring via Check_MK
+## 9. Wartungsfenster
 
-Check_MK überwacht den technischen Betriebszustand des Alarm-Core. **Es greift ausschließlich auf den System-Log und den `/health`-Endpunkt zu – nie auf fachliche Daten.**
+```
+GET    /api/maintenance        → Liste aller Fenster
+POST   /api/maintenance        → Anlegen (label, starts_at, ends_at, source?, keyword?)
+PUT    /api/maintenance/{id}   → Bearbeiten
+DELETE /api/maintenance/{id}   → Löschen
+```
 
-### 9.1 Lokaler Check_MK-Agent
-
-Der Check_MK-Agent läuft als systemd-Service auf dem Alarm-Core-Host. Zusätzlich zur Standardüberwachung (CPU, RAM, Disk, Prozesse) werden zwei **Custom Checks** eingebunden.
-
-**Agent-Plugin-Verzeichnis:** `/usr/lib/check_mk_agent/plugins/`
+Timestamps als RFC3339. Aktive Fenster (jetzt zwischen starts_at und ends_at) unterdrücken Alarme sofort ohne Regeländerung. Globale Fenster (ohne source/keyword) greifen für alle Events.
 
 ---
 
-### 9.2 Custom Check: Subsystem-Health
+## 10. Heartbeat-Überwachung
 
-Fragt den `/health`-Endpunkt des Alarm-Core ab und meldet den Status jedes Subsystems einzeln als Check_MK-Service.
-
-```bash
-#!/bin/bash
-# /usr/lib/check_mk_agent/plugins/alarm_core_health
-
-HEALTH_URL="http://localhost:8080/health"
-RESPONSE=$(curl -sf --max-time 5 "$HEALTH_URL" 2>/dev/null)
-
-if [ $? -ne 0 ]; then
-    echo "<<<alarm_core_health>>>"
-    echo "2 Alarm-Core_Erreichbarkeit - CRIT: /health-Endpunkt nicht erreichbar"
-    exit 0
-fi
-
-echo "<<<alarm_core_health>>>"
-
-# Jeden Subsystem-Status einzeln auslesen und als eigenen Check ausgeben
-for KEY in db asterisk smseagle serial; do
-    VALUE=$(echo "$RESPONSE" | python3 -c "
-import sys, json
-d = json.load(sys.stdin)
-print(d.get('$KEY', 'unbekannt'))
-" 2>/dev/null)
-
-    if [ "$VALUE" = "ok" ]; then
-        STATE=0
-    else
-        STATE=2
-    fi
-
-    LABEL=$(echo "$KEY" | tr '[:lower:]' '[:upper:]')
-    echo "$STATE Alarm-Core_${LABEL} - $( [ $STATE -eq 0 ] && echo 'OK' || echo "CRIT: $VALUE" )"
-done
+```
+GET    /api/heartbeats         → Liste mit berechnetem Status (OK/LATE/UNKNOWN)
+POST   /api/heartbeats         → Heartbeat anlegen
+PUT    /api/heartbeats/{id}    → Bearbeiten
+DELETE /api/heartbeats/{id}    → Löschen
+POST   /api/heartbeat/{name}   → Ping (API-Key-Auth, für externe Systeme)
 ```
 
-**Check_MK-Sektions-Parser** (`~/local/share/check_mk/checks/alarm_core_health`):
+Status-Logik:
+- `OK` — last_seen innerhalb `interval_sec + grace_sec`
+- `LATE` — überfällig
+- `UNKNOWN` — noch nie gepingt
 
-```python
-def inventory_alarm_core_health(info):
-    for line in info:
-        yield line[1], None  # Service-Name aus Zeile
-
-def check_alarm_core_health(item, params, info):
-    for line in info:
-        if line[1] == item:
-            state = int(line[0])
-            detail = " ".join(line[2:])
-            return state, detail
-    return 3, "Service nicht gefunden (UNKNOWN)"
-
-check_info["alarm_core_health"] = {
-    "inventory_function": inventory_alarm_core_health,
-    "check_function":     check_alarm_core_health,
-    "service_description": "%s",
-}
-```
+Bei Ausfall wird ein `core.Event` mit `Source=heartbeat.Source`, `Keyword=heartbeat.Keyword` erzeugt und normal durch die Regelverarbeitung geleitet — Wartungsfenster, Templates und Wiederholungen greifen also auch für Heartbeat-Alarme.
 
 ---
 
-### 9.3 Custom Check: Letzter Alarm-Eingang
+## 11. Nachrichten-Templates
 
-Erkennt, wenn seit längerer Zeit kein Alarm-Event mehr verarbeitet wurde – was auf einen hängenden Worker (z. B. IMAP-Poller, DME-Listener) hinweisen kann.
-
-> **Hinweis:** In Schwachlastzeiten (Nacht, Wochentage ohne Einsatz) ist kein Alarm normal. Der Check ist daher als **passiver Frühindikator** gedacht, nicht als harter Alarm.
-
-```bash
-#!/bin/bash
-# /usr/lib/check_mk_agent/plugins/alarm_core_last_event
-
-# Letzten Alarm-Eingang aus der DB abfragen
-LAST_EVENT=$(psql -U alarmcore -d alarmcore -At -c \
-    "SELECT EXTRACT(EPOCH FROM (NOW() - MAX(eingang_um)))::INT
-     FROM alarm_log
-     WHERE status = 'AUSGELOEST';" 2>/dev/null)
-
-echo "<<<alarm_core_last_event>>>"
-
-if [ -z "$LAST_EVENT" ]; then
-    echo "1 Alarm-Core_LetzterAlarm sekunden=U Kein Alarm-Eintrag in der Datenbank (WARN)"
-    exit 0
-fi
-
-# Schwellwerte: WARN ab 24h, CRIT ab 72h (konfigurierbar)
-WARN_SEC=86400
-CRIT_SEC=259200
-
-if   [ "$LAST_EVENT" -ge "$CRIT_SEC" ]; then STATE=2; LABEL="CRIT"
-elif [ "$LAST_EVENT" -ge "$WARN_SEC" ]; then STATE=1; LABEL="WARN"
-else                                          STATE=0; LABEL="OK"
-fi
-
-STUNDEN=$(( LAST_EVENT / 3600 ))
-echo "$STATE Alarm-Core_LetzterAlarm sekunden=$LAST_EVENT;$WARN_SEC;$CRIT_SEC \
-$LABEL: Letzter Alarm vor ${STUNDEN}h"
 ```
+GET    /api/templates          → Liste aller Templates
+PUT    /api/templates/{channel}→ Setzen/Aktualisieren
+DELETE /api/templates/{channel}→ Löschen (Fallback auf Rohtext)
+```
+
+Template-Beispiel für `voice`:
+```
+Alarm: {keyword} von {source} — {text} — Uhrzeit {time} — Gruppe {group}
+```
+
+Platzhalter werden via `strings.NewReplacer` ersetzt. Fehlt ein Template, wird `event.Text` verwendet.
 
 ---
 
-### 9.4 Journald-Log-Überwachung via Check_MK
+## 12. Alarm-Dashboard (NOC View)
 
-Check_MK kann `journald`-Logs direkt überwachen. Dazu wird in der WATO-Konfiguration eine **Log-Watch-Regel** für die Unit `alarm-core.service` angelegt.
-
-**`/etc/check_mk/logwatch.cfg` auf dem Host:**
-```ini
-[/var/log/alarm-core/alarm-core.log]
- C "level":"ERROR"
- C "level":"FATAL"
- W "level":"WARN"
- I "level":"INFO"
+```
+GET /api/dashboard
 ```
 
-Alternativ direkt über den journald-Plugin-Mechanismus:
-```bash
-# /etc/check_mk/mk_logwatch.cfg
-[journal]
- unit alarm-core.service
- C "level":"ERROR"
- C "level":"FATAL"
- W "level":"WARN"
-```
+Liefert in einem Aufruf:
+- `recent_events` — letzte 20 Einträge aus `event_log`
+- `open_events` — unquittierte Events der letzten 24h (rot hervorgehoben im Frontend)
+- `active_maintenance` — derzeit aktive Wartungsfenster
+- `heartbeats` — alle Heartbeats mit berechnetem Status
 
-Check_MK sammelt dann alle ERROR/FATAL-Einträge als **CRIT**-Events im Event-Log, WARN-Einträge als **WARN** – ohne dass ein Admin permanent in den Logs suchen muss.
+Das Frontend zeigt diese Daten auf einer Echtzeit-aktualisierbaren Übersichtsseite (30s Auto-Refresh) — primär für NOC-Displays gedacht.
 
 ---
 
-### 9.5 Übersicht: Check_MK-Services nach dieser Konfiguration
+## 13. Statistiken
 
-| Service-Name | Quelle | WARN wenn | CRIT wenn |
-|---|---|---|---|
-| `Alarm-Core_Erreichbarkeit` | `/health`-Endpunkt | — | Endpunkt nicht antwortend |
-| `Alarm-Core_DB` | `/health` → `db` | — | DB-Status nicht `ok` |
-| `Alarm-Core_ASTERISK` | `/health` → `asterisk` | — | AMI nicht erreichbar |
-| `Alarm-Core_SMSEAGLE` | `/health` → `smseagle` | — | SMS-API nicht erreichbar |
-| `Alarm-Core_SERIAL` | `/health` → `serial` | — | Serieller Port inaktiv |
-| `Alarm-Core_LetzterAlarm` | PostgreSQL | > 24h kein Alarm | > 72h kein Alarm |
-| `Alarm-Core_Log` | journald logwatch | `WARN`-Einträge | `ERROR`/`FATAL`-Einträge |
+```
+GET /api/stats
+```
+
+Rückgabe:
+- `total_events` — Gesamtanzahl Events
+- `acked_events` — davon quittiert
+- `events_per_day` — Array der letzten 30 Tage (für Balkendiagramm)
+- `top_keywords` — Top-10 Keywords nach Häufigkeit
+- `top_sources` — Top-10 Sources
+- `channel_usage` — Nutzungszähler pro Kanal (via `UNNEST(channels)`)
 
 ---
 
-## 10. Erweiterungen (Roadmap)
+## 14. REST-API & OpenAPI
 
-| Feature | Beschreibung | Priorität |
+Vollständige OpenAPI-3.0-Spezifikation unter `GET /api/openapi.yaml`. Swagger UI unter `GET /api/docs` (Swagger UI 5 via CDN).
+
+Alle Admin-Endpoints (`/api/rules`, `/api/groups`, `/api/recipients`, `/api/users`, `/api/channel-configs`, `/api/apikeys`, `/api/maintenance`, `/api/heartbeats`, `/api/templates`, `/api/stats`, `/api/dashboard`) erfordern JWT-Auth mit `role=admin`. Viewer-Rolle kann `/api/events` (Liste), `/api/acknowledgements`, `/api/announcements` lesen.
+
+API-Keys (gehasht mit bcrypt in `api_keys`-Tabelle) sind für maschinelle Einlieferer (`POST /api/events`, `POST /api/heartbeat/{name}`). Plaintext wird nur bei Erstellung einmalig angezeigt.
+
+---
+
+## 15. Frontend (Vue 3 + Tailwind)
+
+Einzelne SPA unter `frontend/`, gebaut mit Vite + Tailwind CSS + Pinia.
+
+| Route | Seite | Rolle |
 |---|---|---|
-| **Quittierung** | Kameraden bestätigen per SMS-Antwort oder App: "Komme / Komme nicht" | Hoch |
-| **Eskalation** | Wenn nach X Minuten < N Quittierungen eingegangen: automatisch nächste Gruppe alarmieren | Hoch |
-| **Web-UI** | Administrationsoberfläche für Regeln, Gruppen, Personenverwaltung | Mittel |
-| **Push-Notification** | Zusätzlicher Kanal über Firebase (Android) / APNs (iOS) | Mittel |
-| **Einsatz-Protokoll** | Übersicht aller Alarme mit Quittierungsquote pro Einsatz, Export als PDF | Niedrig |
+| `/dashboard` | Alarm-Dashboard (NOC View) | alle |
+| `/` | Regeln (CRUD) | admin |
+| `/groups` | Gruppen & Empfänger | admin |
+| `/events` | Event-Log (Filter, Ack) | alle |
+| `/announcements` | Sound-Uploads | admin |
+| `/maintenance` | Wartungsfenster | admin |
+| `/heartbeats` | Heartbeat-Überwachung | admin |
+| `/templates` | Nachrichten-Templates | admin |
+| `/stats` | Statistiken | admin |
+| `/channels` | Kanal-Konfiguration | admin |
+| `/apikeys` | API-Key-Verwaltung | admin |
+| `/users` | Benutzerverwaltung | admin |
+| `/me/groups` | Eigene Gruppenaktivierung | alle |
+| `/handbuch` | Vollständiges Handbuch | alle |
+
+Dark Mode mit Tailwind `dark:` Klassen, persistiert in localStorage. Kontextsensitive Hilfe via F1. Vollständiges Handbuch (`/handbuch`) mit Sidebar-Navigation.
 
 ---
 
-## 11. Offene Punkte
+## 16. Deployment (Debian 13, nativ — kein Docker für Asterisk)
 
-- **Authentifizierung am REST-Endpoint:** Mindestens API-Key-Validierung, besser mTLS, um Fremdalarmierung zu verhindern.
-- **TTS vs. Sprachdateien:** Asterisk kann Text-to-Speech-Module (z. B. `Festival`) nutzen oder feste `.wav`-Ansagedateien abspielen – Entscheidung steht aus.
-- **Datenschutz:** Rufnummern und Personendaten in der DB müssen verschlüsselt oder hinter Datenbankzugriffsrollen abgesichert werden (DSGVO).
-- **Deployment:** Ob als systemd-Service, Docker-Container oder direkt auf dem Leitstellen-PC – noch nicht definiert.
-- **Auswertungs-UI für Vorgesetzte:** Die SQL-Queries aus Kapitel 8.2 sind Grundlage; ein einfaches schreibgeschütztes Web-Dashboard (z. B. Grafana mit PostgreSQL-Datasource) wäre der nächste Schritt.
+Alle Scripts unter `deploy/`.
+
+| Script | Zweck |
+|---|---|
+| `setup.sh` | Interaktiver Assistent, schreibt `/etc/alarm-core/alarm-core.env` |
+| `install-postgres.sh` | Paket, Rolle/DB, Migrationen, täglicher pg_dump (14 Tage) |
+| `install-asterisk.sh` | Build aus Quellcode (kein Debian-13-Paket), AMI, PJSIP, TTS |
+| `install-alarm-core.sh` | Service-User, Binary, systemd-Unit |
+
+**Stolpersteine:**
+1. `Type=notify` im Asterisk-Unit braucht `libsystemd-dev` beim Build.
+2. Postgres-Postinst startet Cluster nicht zuverlässig — Script ruft `systemctl enable --now postgresql` + `pg_isready` explizit auf.
+3. TTS-WAV-Schreibrechte: `alarm-core` muss Gruppe `asterisk` sein + `ReadWritePaths=/var/lib/asterisk/sounds/custom` in systemd-Unit.
+
+**Proxy/Mailrelay:** `setup.sh` fragt optional HTTP/HTTPS-Proxy (Go respektiert `HTTP_PROXY`/`HTTPS_PROXY` via `http.ProxyFromEnvironment`) und Postfix-Satellite-Setup ab.
+
+---
+
+## 17. Offene Punkte
+
+| Punkt | Stand |
+|---|---|
+| Inbound-Quittierungskanal | `/api/acknowledgements` existiert, aber kein automatischer Aufrufer (SMS-Inbound, DTMF) |
+| Weitere Eingangskanäle | IMAP/E-Mail-Polling, seriell/DME — `core.Event` ist vorbereitet |
+| Mitternacht-Zeitfenster | Bewusst nicht gefixt, Workaround: zwei Regeln |
+| Check_MK-Plugin | `/health` liefert DB-Status; Agent-Plugin nicht gebaut |
+| LDAP-Authentifizierung | Benutzer aktuell nur lokal in `users`-Tabelle |
+| SMSEAGLE API-Key-Login | SMSEAGLE unterstützt auch API-Key-Auth — noch nicht implementiert |
+| Eigene Gruppenaktivierung durch User | UI vorhanden (`/me/groups`), zeitgesteuerte Slots (z.B. nur 8–17 Uhr aktiv) noch offen |
+
+---
+
+## 18. Repo-Struktur
+
+```
+alarmserver/
+├── cmd/alarm-core/main.go            — Wiring, Env-Var-Konfiguration, HTTP-Server
+├── internal/
+│   ├── core/                         — Event, Rule, RuleEngine, Processor,
+│   │                                    Notifier/AuditWriter/MaintenanceChecker/
+│   │                                    TemplateLoader/AckStatusChecker-Interfaces
+│   ├── db/                           — PostgreSQL-Implementierungen:
+│   │   ├── rules.go, groups.go       — CRUD
+│   │   ├── audit.go, acknowledgements.go
+│   │   ├── maintenance.go            — Wartungsfenster (v2.0)
+│   │   ├── heartbeats.go             — Heartbeat-Store (v2.0)
+│   │   ├── templates.go              — Nachrichten-Templates (v2.0)
+│   │   ├── stats.go                  — Statistiken (v2.0)
+│   │   └── migrations/               — 0001…0011_*.sql
+│   ├── api/                          — HTTP-Handler:
+│   │   ├── events.go, announcements.go, acknowledgements.go
+│   │   ├── maintenance.go            — v2.0
+│   │   ├── heartbeats.go             — v2.0
+│   │   ├── templates.go              — v2.0
+│   │   ├── dashboard.go              — v2.0
+│   │   ├── stats.go                  — v2.0
+│   │   └── openapi.go                — Swagger UI + YAML (v2.0)
+│   ├── notify/{asterisk,smseagle,email,teams}/
+│   └── tts/espeak/
+├── frontend/                         — Vue 3 + Vite + Tailwind
+│   └── src/
+│       ├── views/                    — 14 Views inkl. Dashboard, Handbook
+│       ├── stores/                   — auth, theme, sidebar (Pinia)
+│       ├── components/               — AppSidebar, HelpPanel, ...
+│       └── content/helpTexts.js      — Kontexthilfe für alle Routen
+└── deploy/                           — setup.sh + install-*.sh + systemd-Unit + Env-Template
+```
+
+## 19. Repo
+
+```
+https://github.com/bh2005/alarmserver
+```

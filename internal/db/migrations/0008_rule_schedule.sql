@@ -1,0 +1,1 @@
+ALTER TABLE rules ADD COLUMN schedule JSONB NOT NULL DEFAULT '[]';

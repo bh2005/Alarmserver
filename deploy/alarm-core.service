@@ -1,0 +1,23 @@
+[Unit]
+Description=Alarm-Core notification engine
+After=network.target postgresql.service
+
+[Service]
+Type=simple
+User=alarm-core
+Group=alarm-core
+EnvironmentFile=/etc/alarm-core/alarm-core.env
+ExecStart=/opt/alarm-core/bin/alarm-core
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+# TTS output and uploaded announcements are written here (see
+# ASTERISK_SOUNDS_DIR in alarm-core.env.example). Leading "-" makes this
+# entry optional — without it, the service fails to start with
+# "226/NAMESPACE" whenever Asterisk (and thus this directory) isn't
+# installed, e.g. when only SMS/email/Teams channels are used.
+ReadWritePaths=-/var/lib/asterisk/sounds/custom
+
+[Install]
+WantedBy=multi-user.target

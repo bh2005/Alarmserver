@@ -1,0 +1,7 @@
+# Debian 13 + systemd, for locally exercising the install-*.sh scripts
+# against a real systemd/apt/postgres/asterisk stack. Not used in
+# production — alarm-core itself runs natively per deploy/setup.sh.
+FROM debian:13
+RUN apt-get update && apt-get install -y systemd systemd-sysv sudo curl gnupg2 procps && apt-get clean
+STOPSIGNAL SIGRTMIN+3
+CMD ["/lib/systemd/systemd"]
