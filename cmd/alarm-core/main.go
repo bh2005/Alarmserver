@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -273,6 +274,38 @@ func main() {
 
 	mux.HandleFunc("/health", api.HealthHandler(map[string]api.HealthChecker{
 		"db": func(ctx context.Context) string { return pool.Ping(ctx) },
+		"rules": func(ctx context.Context) string {
+			rules, err := ruleStore.List(ctx)
+			if err != nil {
+				return "error: " + err.Error()
+			}
+			active := 0
+			for _, r := range rules {
+				if r.Active {
+					active++
+				}
+			}
+			return fmt.Sprintf("ok: %d active", active)
+		},
+		"event_queue": func(_ context.Context) string {
+			used := len(events)
+			cap := cap(events)
+			pct := used * 100 / cap
+			if pct >= 90 {
+				return fmt.Sprintf("warn: %d/%d (%.0f%%)", used, cap, float64(pct))
+			}
+			return fmt.Sprintf("ok: %d/%d", used, cap)
+		},
+		"notifiers": func(_ context.Context) string {
+			if len(notifiers) == 0 {
+				return "warn: no notifiers configured"
+			}
+			channels := make([]string, 0, len(notifiers))
+			for ch := range notifiers {
+				channels = append(channels, ch)
+			}
+			return fmt.Sprintf("ok: %s", strings.Join(channels, ","))
+		},
 	}))
 
 	httpServer := &http.Server{Addr: listenAddr, Handler: mux}

@@ -35,6 +35,7 @@ func (s *Server) HandleWebhook(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var payload struct {
+		Source  string `json:"source"`
 		Keyword string `json:"keyword"`
 		Text    string `json:"text"`
 	}
@@ -46,9 +47,13 @@ func (s *Server) HandleWebhook(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "keyword is required", http.StatusBadRequest)
 		return
 	}
+	source := payload.Source
+	if source == "" {
+		source = "WEBHOOK"
+	}
 
 	event := core.Event{
-		Source:     "WEBHOOK",
+		Source:     source,
 		Keyword:    payload.Keyword,
 		Text:       payload.Text,
 		ReceivedAt: time.Now(),

@@ -1,0 +1,136 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Check_MK Notification Script — Alarmserver Connector
+=====================================================
+Leitet Check_MK-Benachrichtigungen an den Alarmserver weiter.
+
+Installation:
+  cp alarmserver_notify /omd/sites/<site>/local/share/check_mk/notifications/
+  chmod +x /omd/sites/<site>/local/share/check_mk/notifications/alarmserver_notify
+
+Konfiguration in Check_MK (WATO → Notifications → Add rule):
+  Notification method: "Alarmserver Connector"
+  Parameter ALARMSERVER_URL: http://alarm-core:8080/api/events
+  Parameter ALARMSERVER_APIKEY: <API-Key aus Alarmserver-UI>
+  Parameter ALARMSERVER_SOURCE: checkmk        (optional, default: checkmk)
+  Parameter ALARMSERVER_KEYWORD_CRIT: CRIT     (optional)
+  Parameter ALARMSERVER_KEYWORD_WARN: WARN     (optional)
+  Parameter ALARMSERVER_KEYWORD_DOWN: DOWN     (optional)
+  Parameter ALARMSERVER_SKIP_RECOVERY: yes     (optional, kein Event bei OK)
+  Parameter ALARMSERVER_SKIP_SOFT: yes         (optional, kein Event bei SOFT-State)
+
+Umgebungsvariablen (automatisch von Check_MK gesetzt):
+  NOTIFY_WHAT             HOST oder SERVICE
+  NOTIFY_NOTIFICATIONTYPE PROBLEM, RECOVERY, ACKNOWLEDGEMENT, ...
+  NOTIFY_HOSTNAME         Hostname
+  NOTIFY_HOSTSTATE        UP, DOWN, UNREACHABLE
+  NOTIFY_SERVICESTATE     OK, WARN, CRIT, UNKNOWN (nur bei SERVICE)
+  NOTIFY_SERVICEDESC      Service-Beschreibung (nur bei SERVICE)
+  NOTIFY_SERVICEOUTPUT    Plugin-Ausgabe (nur bei SERVICE)
+  NOTIFY_HOSTOUTPUT       Host-Plugin-Ausgabe
+  NOTIFY_SERVICESTATETYPE HARD, SOFT
+  NOTIFY_HOSTSTATETYPE    HARD, SOFT
+"""
+import json
+import os
+import sys
+import urllib.request
+import urllib.error
+
+# ── Konfiguration aus Check_MK-Parametern ──────────────────────────────────
+URL        = os.environ.get("NOTIFY_PARAMETER_ALARMSERVER_URL", "http://localhost:8080/api/events")
+API_KEY    = os.environ.get("NOTIFY_PARAMETER_ALARMSERVER_APIKEY", "")
+SOURCE     = os.environ.get("NOTIFY_PARAMETER_ALARMSERVER_SOURCE", "checkmk")
+KW_CRIT    = os.environ.get("NOTIFY_PARAMETER_ALARMSERVER_KEYWORD_CRIT", "CRIT")
+KW_WARN    = os.environ.get("NOTIFY_PARAMETER_ALARMSERVER_KEYWORD_WARN", "WARN")
+KW_DOWN    = os.environ.get("NOTIFY_PARAMETER_ALARMSERVER_KEYWORD_DOWN", "DOWN")
+SKIP_RECOV = os.environ.get("NOTIFY_PARAMETER_ALARMSERVER_SKIP_RECOVERY", "yes").lower() == "yes"
+SKIP_SOFT  = os.environ.get("NOTIFY_PARAMETER_ALARMSERVER_SKIP_SOFT", "yes").lower() == "yes"
+
+# ── Check_MK-Kontext ────────────────────────────────────────────────────────
+what      = os.environ.get("NOTIFY_WHAT", "SERVICE")          # HOST | SERVICE
+notif_type = os.environ.get("NOTIFY_NOTIFICATIONTYPE", "PROBLEM")
+hostname  = os.environ.get("NOTIFY_HOSTNAME", "unknown")
+host_state = os.environ.get("NOTIFY_HOSTSTATE", "")
+svc_desc  = os.environ.get("NOTIFY_SERVICEDESC", "")
+svc_state = os.environ.get("NOTIFY_SERVICESTATE", "")
+svc_output = os.environ.get("NOTIFY_SERVICEOUTPUT", "")
+host_output = os.environ.get("NOTIFY_HOSTOUTPUT", "")
+state_type = os.environ.get(
+    "NOTIFY_SERVICESTATETYPE" if what == "SERVICE" else "NOTIFY_HOSTSTATETYPE", "HARD"
+)
+
+# ── Recovery und SOFT-States überspringen ───────────────────────────────────
+if SKIP_RECOV and notif_type == "RECOVERY":
+    sys.exit(0)
+
+if SKIP_SOFT and state_type == "SOFT":
+    sys.exit(0)
+
+# Nur PROBLEM und ACKNOWLEDGEMENT weiterleiten (kein FLAPPING, DOWNTIME, ...)
+if notif_type not in ("PROBLEM", "ACKNOWLEDGEMENT"):
+    sys.exit(0)
+
+# ── Keyword bestimmen ────────────────────────────────────────────────────────
+if what == "HOST":
+    state = host_state
+    keyword = KW_DOWN if state in ("DOWN", "UNREACHABLE") else KW_WARN
+    output = host_output
+    description = f"Host {hostname} ist {state}"
+else:
+    state = svc_state
+    if state == "CRIT":
+        keyword = KW_CRIT
+    elif state == "WARN":
+        keyword = KW_WARN
+    else:
+        keyword = KW_WARN   # UNKNOWN → WARN
+    output = svc_output
+    description = f"{hostname} / {svc_desc} ist {state}"
+
+# ── Event-Text zusammenbauen ─────────────────────────────────────────────────
+lines = [
+    description,
+    f"Typ: {notif_type} ({state_type})",
+    f"Output: {output}",
+]
+if notif_type == "ACKNOWLEDGEMENT":
+    ack_author  = os.environ.get("NOTIFY_NOTIFICATIONAUTHOR", "")
+    ack_comment = os.environ.get("NOTIFY_NOTIFICATIONCOMMENT", "")
+    if ack_author:
+        lines.append(f"Quittiert von: {ack_author}")
+    if ack_comment:
+        lines.append(f"Kommentar: {ack_comment}")
+
+text = "\n".join(lines)
+
+# ── An Alarmserver senden ────────────────────────────────────────────────────
+payload = json.dumps({
+    "source":  SOURCE,
+    "keyword": keyword,
+    "text":    text,
+}).encode("utf-8")
+
+headers = {
+    "Content-Type": "application/json",
+    "User-Agent":   "checkmk-alarmserver-connector/1.0",
+}
+if API_KEY:
+    headers["X-API-Key"] = API_KEY
+
+req = urllib.request.Request(URL, data=payload, headers=headers, method="POST")
+try:
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        status = resp.status
+        if status not in (200, 201, 202):
+            print(f"Alarmserver returned HTTP {status}", file=sys.stderr)
+            sys.exit(2)
+except urllib.error.HTTPError as e:
+    print(f"HTTP error {e.code}: {e.reason}", file=sys.stderr)
+    sys.exit(2)
+except urllib.error.URLError as e:
+    print(f"Connection error: {e.reason}", file=sys.stderr)
+    sys.exit(2)
+
+sys.exit(0)
