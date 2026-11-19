@@ -155,6 +155,26 @@ GET    /health
 
 ## Deployment (Produktion, Debian 13)
 
+### Voraussetzungen und Build
+
+- Debian 13, Root-Zugriff und Internetzugang (oder ein HTTP-Proxy; `setup.sh` fragt danach).
+- Das Binary `alarm-core` ist **nicht** im Repository enthalten. `setup.sh` prüft das gleich am Anfang und baut es auf Wunsch
+  aus dem Quellcode (installiert dafür bei Bedarf `golang-go`). Es wird gebaut, bevor PostgreSQL und Asterisk installiert werden.
+- `go.mod` verlangt Go 1.26. Debian 13 liefert eine ältere Version; die Go-Toolchain lädt die passende Version automatisch nach
+  (`GOTOOLCHAIN=auto`, benötigt Internet oder den Proxy). Alternativ ein aktuelles Go von <https://go.dev/dl/> installieren.
+
+Manuell bauen (auf dem Zielrechner, im Repo-Verzeichnis):
+
+```bash
+go build -o deploy/alarm-core ./cmd/alarm-core
+# auf einem anderen Rechner bauen: GOOS=linux GOARCH=amd64 go build -o deploy/alarm-core ./cmd/alarm-core
+```
+
+*English:* the `alarm-core` binary is not shipped in the repository. `setup.sh` checks for it first and can build it from source
+(it installs `golang-go` if needed). `go.mod` requires Go 1.26; the Go toolchain downloads it automatically if the packaged Go is older.
+
+### Installation
+
 ```bash
 cd deploy
 sudo bash setup.sh

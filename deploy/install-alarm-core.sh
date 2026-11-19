@@ -2,8 +2,9 @@
 # Installs the alarm-core binary as a systemd service on Debian 13.
 # Idempotent: safe to re-run (won't overwrite an existing config).
 #
-# Build the binary first, from the repo root:
-#   GOOS=linux GOARCH=amd64 go build -o deploy/alarm-core ./cmd/alarm-core
+# Build the binary first, from the repo root (needs Go; setup.sh can do this for you):
+#   go build -o deploy/alarm-core ./cmd/alarm-core
+# Building on another machine: GOOS=linux GOARCH=amd64 go build -o deploy/alarm-core ./cmd/alarm-core
 #
 # Usage (run on the target host, from this directory):
 #   ./install-alarm-core.sh
@@ -20,8 +21,9 @@ BIN_SRC="${SCRIPT_DIR}/alarm-core"
 
 if [ ! -f "$BIN_SRC" ]; then
     echo "Error: binary not found at ${BIN_SRC}." >&2
-    echo "Build it first (from the repo root):" >&2
-    echo "  GOOS=linux GOARCH=amd64 go build -o deploy/alarm-core ./cmd/alarm-core" >&2
+    echo "The binary is not part of the repository. Build it first (from the repo root, needs Go):" >&2
+    echo "  go build -o deploy/alarm-core ./cmd/alarm-core" >&2
+    echo "(setup.sh can do this for you; see 'Voraussetzungen und Build' in the README)" >&2
     exit 1
 fi
 

@@ -69,6 +69,35 @@ ask_yesno "Install / configure PostgreSQL?" y && INSTALL_POSTGRES=true
 ask_yesno "Install / configure Asterisk (voice channel)?" y && INSTALL_ASTERISK=true
 ask_yesno "Install the alarm-core service?" y && INSTALL_ALARM_CORE=true
 
+# --- alarm-core binary preflight --------------------------------------------
+# The binary is not part of the repository. Check this first - before asking many
+# questions and before anything is installed - and offer to build it from source.
+BIN_PATH="${SCRIPT_DIR}/alarm-core"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+BUILD_BINARY=false
+if $INSTALL_ALARM_CORE && [ ! -f "$BIN_PATH" ]; then
+    echo
+    echo "The alarm-core binary is not part of the repository (${BIN_PATH} not found)."
+    if [ -d "${REPO_ROOT}/cmd/alarm-core" ]; then
+        if command -v go >/dev/null 2>&1; then
+            echo "Go toolchain found: $(go version)"
+        else
+            echo "Go is not installed; it would be installed with apt (golang-go)."
+        fi
+        if ask_yesno "Build alarm-core from source as the first installation step?" y; then
+            BUILD_BINARY=true
+        fi
+    fi
+    if ! $BUILD_BINARY; then
+        echo "Cannot continue without the binary. Build it first (from the repo root, needs Go):" >&2
+        echo "  go build -o deploy/alarm-core ./cmd/alarm-core" >&2
+        echo "or build it on another machine (GOOS=linux GOARCH=amd64) and copy it to ${BIN_PATH}." >&2
+        echo "Nothing was changed." >&2
+        exit 1
+    fi
+fi
+# --- end alarm-core binary preflight ----------------------------------------
+
 echo
 echo "--- Internet access ---"
 if ask_yesno "Does this host need an HTTP/HTTPS proxy for internet access (apt, webhooks)?" n; then
@@ -165,6 +194,7 @@ echo
 echo "=== Summary ==="
 [ -n "$PROXY_URL" ]        && echo "Proxy:      ${PROXY_URL} (bypass: ${NO_PROXY_HOSTS})"
 [ -n "$MAIL_RELAY_HOST" ]  && echo "Mail relay: ${MAIL_RELAY_HOST}:${MAIL_RELAY_PORT}$($CONFIGURE_SYSTEM_RELAY && echo " (+ system mail)")"
+$BUILD_BINARY        && echo "Build:      alarm-core is built from source (Go) before anything is installed"
 $INSTALL_POSTGRES    && echo "PostgreSQL: db=${DB_NAME} user=${DB_USER}"
 $INSTALL_ASTERISK    && echo "Asterisk:   AMI user=${AMI_USER} allowed_from=${AMI_ALLOWED_FROM} tts=${TTS_ENABLED}"
 if $INSTALL_ALARM_CORE; then
@@ -188,6 +218,25 @@ EOF
     export no_proxy="$NO_PROXY_HOSTS" NO_PROXY="$NO_PROXY_HOSTS"
 fi
 
+if $BUILD_BINARY; then
+    echo
+    echo ">>> building alarm-core from source"
+    if ! command -v go >/dev/null 2>&1; then
+        DEBIAN_FRONTEND=noninteractive apt-get update -qq
+        DEBIAN_FRONTEND=noninteractive apt-get install -y golang-go
+    fi
+    echo "Go: $(go version)"
+    echo "(go.mod may require a newer Go than this Debian release ships; the Go toolchain then downloads"
+    echo " the required version automatically - this needs internet access or the proxy configured above)"
+    export HOME="${HOME:-/root}"
+    if ! (cd "$REPO_ROOT" && CGO_ENABLED=0 GOFLAGS=-buildvcs=false go build -o "$BIN_PATH" ./cmd/alarm-core); then
+        echo "Error: building alarm-core failed. Nothing else has been installed yet." >&2
+        echo "Check the Go output above (typically: no internet access / proxy, or not enough disk space)." >&2
+        exit 1
+    fi
+    chmod +x "$BIN_PATH"
+    echo "Built ${BIN_PATH}"
+fi
 if [ -n "$MAIL_RELAY_HOST" ] && $CONFIGURE_SYSTEM_RELAY; then
     echo
     echo ">>> configuring system mail relay (postfix satellite)"
@@ -231,8 +280,7 @@ if $INSTALL_ALARM_CORE; then
     if [ ! -f "${SCRIPT_DIR}/alarm-core" ]; then
         echo
         echo "Error: ${SCRIPT_DIR}/alarm-core binary not found." >&2
-        echo "Build it on your dev machine first:" >&2
-        echo "  GOOS=linux GOARCH=amd64 go build -o deploy/alarm-core ./cmd/alarm-core" >&2
+        echo "Build it first (needs Go): go build -o deploy/alarm-core ./cmd/alarm-core" >&2
         exit 1
     fi
 
